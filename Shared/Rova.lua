@@ -1,8 +1,9 @@
 --[[
-	Rova Framework
-	Author: Dr_K4rma aka Alexander Karpov
-	Date: 1 Feb. 2021
-	Provides: Rova Framework Driver
+	@Title: Rova Framework
+	@Author: Dr_K4rma aka Alexander Karpov
+	@Date: 1 Feb. 2021
+	@Package: RovaFramework.Shared
+	@Provides: Rova Framework Driver
 ]]
 
 local module = {}
@@ -22,12 +23,14 @@ local RS = game:GetService("RunService")
 ----------------------------------
 --		CONFIG VARIABLES
 ----------------------------------
-local FRAMEWORK_TAG_NAME = "RovaFrameworkFolder"
-local frameworkFolders = {}
+local FRAMEWORK_TAG_NAME = "RovaFrameworkFolder"	-- The tag that is used to identify Rova Framework folders
+local USE_INJECTED_METHODS = true					-- Whether or not to allow Rova to inject methods into the function environment of the scripts where it is initialized
+local CLEAR_GLOBAL_AFTER_LOAD_ON_CLIENT = true		-- Whether _G as callable function is cleared after modules are all loaded. Setting this to false presents security rist for client-side
 
 ----------------------------------
 --		MISC VARIABLES
 ----------------------------------
+local frameworkFolders = {}
 local packages = {}
 local default = {}
 
@@ -97,7 +100,7 @@ local function loadModule(Module)
 	elseif typeof(Module) == "Instance" then
 		moduleHandle = Module.Name
 	end
-	
+
 	local Module = packages[moduleHandle]
 	if typeof(Module) == "Instance" then
 		local success, err = pcall(function()
@@ -118,7 +121,7 @@ local function loadModule(Module)
 	end
 end
 
-local function manifestHandler(ManifestFile)
+local function manifestHandleInit(ManifestFile)
 	local manifest = nil
 	local success, err = pcall(function()
 		manifest = require(ManifestFile)
@@ -126,8 +129,13 @@ local function manifestHandler(ManifestFile)
 	if not success then
 		error("Failed to load module "..ManifestFile:GetFullName()..": "..err)
 	end
+	return manifest
+end
+
+local function manifestHandleMove(ManifestFile)
+	local manifest = require(ManifestFile)
 	
-	-- If on the server, move folders to proper locations
+	-- If on the server, move folders to proper location
 	if not RS:IsClient() then
 		if manifest.__location then
 			local FrameworkFolder = retrieve("RovaFramework", "Folder", manifest.__location)
@@ -135,6 +143,10 @@ local function manifestHandler(ManifestFile)
 			ManifestFile.Parent.Parent = FrameworkFolder
 		end
 	end
+end
+
+local function manifestHandleLoad(ManifestFile)
+	local manifest = require(ManifestFile)
 	
 	-- Implementation of ignore function based on tag in manifest
 	if manifest.__tags then
@@ -146,11 +158,11 @@ local function manifestHandler(ManifestFile)
 			if isInTable("ServerIgnore", manifest.__tags) then return end
 		end
 	end
-	
+
 	-- Handles the loading of manifest-defined modules
 	for index, path in pairs(manifest) do
 		if string.sub(index, 1, 2) == "__" then continue end
-		
+
 		local splitPath = string.split(path, ".")
 		local Module = frameworkFolders
 		for _, directory in pairs(splitPath) do
@@ -162,7 +174,7 @@ end
 
 local function importHandler(moduleName)
 	local fenv = getfenv(0)
-	
+
 	fenv[moduleName] = loadModule(moduleName)
 end
 
@@ -181,53 +193,38 @@ local function extendsHandler(superName)
 			error("Failed to extend class \'"..superName.."\', make sure the class is imported:\n"..debug.traceback())
 		end
 	end
-	
+
 	local public = fenv.public
-	
+
 	-- Implements super as actual super
 	fenv.super = fenv[superName]
-	
+
 	fenv.public = setmetatable(fenv.public, {__index = fenv[superName]})
 	fenv.public.__index = fenv.public
-	
+
 	--setmetatable(fenv.public, {__index = fenv[superName]})
 end
 
-
-local function testFenv(mark_point)
-	local fenv = getfenv(3)
-	
-	local obj = obj3Class.new()
-	obj3:Print()
-	
-	print("Testing")
-end
-
 local function initHandler(Module)
-	local fenv = getfenv(0)
-
-	-- Help public exist
-	--fenv.public = fenv.public or {}
-	--if not fenv.public then
-	--	fenv.public = {}
-	--end
-
-	-- Initializing new object for 'public' table
-	--fenv.public.__index = fenv.public
-
-	-- Initializing new variables
-	--fenv.super = nil
-
-	-- Injecting new methods
-	fenv.import = importHandler
-	--fenv.extends = extendsHandler
-	--fenv.testFenv = testFenv
+	if USE_INJECTED_METHODS then
+		local fenv = getfenv(0)
+		
+		-- Injecting new methods
+		fenv.import = importHandler
+	end
 end
 
 ----------------------------------
 --		PUBLIC FUNCTIONS
 ----------------------------------
-
+--[[
+	Returns the library table with the passed name
+	@f_name <String> name of library
+	@returns <table> table of functions from library
+]]
+function module:LoadLibrary(f_name)
+	return loadModule(f_name)
+end
 
 ----------------------------------
 --		MAIN CODE
@@ -255,23 +252,51 @@ for _, FrameworkFolder in pairs(frameworkFolders) do
 	end
 end
 
+-- Storing reference to rova in _G
+_G.Rova = module
+
 -- Initializing _G as callable table
 setmetatable(_G, {__call = initHandler})
 
--- Initializing framework folder
+-- Handle initialization of manifest files
 for _, FrameworkFolder in pairs(frameworkFolders) do
 	local Manifest = FrameworkFolder:FindFirstChild(".Manifest")
 	
 	if not Manifest then
-		errorNoBreak(FrameworkFolder:GetFullName().."is missing a manifest file")
+		errorNoBreak(FrameworkFolder:GetFullName().." is missing a manifest file")
 		continue
 	end
-	local success, err = pcall(manifestHandler, Manifest)
+	
+	local success, err = pcall(manifestHandleInit, Manifest)
 	if not success then
-		error("Failed to load manifest file "..Manifest:GetFullName()..". Errata as follows:\n"..err)
+		error("[Manifest Initialization Failure]: "..Manifest:GetFullName()..". Errata as follows:\n"..err)
 	end
 end
 
---@TODO leaving _G() as initHandler is risky for security
+-- Handle moving of framework folders
+for _, FrameworkFolder in pairs(frameworkFolders) do
+	local Manifest = FrameworkFolder:FindFirstChild(".Manifest")
+	
+	local success, err = pcall(manifestHandleMove, Manifest)
+	if not success then
+		error("[Directory Move Failure]: "..Manifest:GetFullName()..". Errata as follows:\n"..err)
+	end
+end
+
+-- Handles loading of the modules defined in the manifest file
+for _, FrameworkFolder in pairs(frameworkFolders) do
+	local Manifest = FrameworkFolder:FindFirstChild(".Manifest")
+
+	local success, err = pcall(manifestHandleLoad, Manifest)
+	if not success then
+		error("[Module Load Failure]: "..Manifest:GetFullName()..". Errata as follows:\n"..err)
+	end
+end
+
+-- Clear _G.Rova and _G() on client in order to avoid security problems
+if RS:IsClient() and CLEAR_GLOBAL_AFTER_LOAD_ON_CLIENT then
+	_G.Rova = nil
+	setmetatable(_G, {__call = nil})
+end
 
 return module
