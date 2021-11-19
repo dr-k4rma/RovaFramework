@@ -1,10 +1,10 @@
 --[[
 	@Title: Rova Framework
-	@Author: Dr_K4rma aka Alexander Karpov
-	@Date: 1 Feb. 2021
-	@Package: RovaFramework.Shared
+	@Author: Dr_K4rma
+	@Date: 1 Feb. 2021, updated 18 Nov. 2021
+	@Package: ServerScriptService.RovaFramework.Shared
 	@Provides: Rova Framework Driver
-]]
+]]--
 
 local module = {}
 
@@ -24,8 +24,17 @@ local RS = game:GetService("RunService")
 --		CONFIG VARIABLES
 ----------------------------------
 local FRAMEWORK_TAG_NAME = "RovaFrameworkFolder"	-- The tag that is used to identify Rova Framework folders
-local USE_INJECTED_METHODS = true					-- Whether or not to allow Rova to inject methods into the function environment of the scripts where it is initialized
-local CLEAR_GLOBAL_AFTER_LOAD_ON_CLIENT = true		-- Whether _G as callable function is cleared after modules are all loaded. Setting this to false presents security rist for client-side
+
+-- Behavior Variables
+local USE_INJECTED_METHODS = true					-- Whether or not to allow Rova to inject methods into the function environment of the scripts where it is initialized.
+local CLEAR_GLOBAL_AFTER_LOAD_ON_CLIENT = true		-- Whether _G as callable function is cleared after modules are all loaded. Setting this to false presents security rist for client-side.
+local CLIENT_DELETE_MODULE_AFTER_CACHE = true 		-- Whether or not ModuleScripts initialized on the client are deleted after they are cached in the framework.
+local MODULE_LOAD_TIMEOUT = 0.5						-- How long Rova will wait for a module to load before it moved onto loading the next module. Set to math.huge for indefinite yield.
+
+-- Debug variables
+local PRINT_MANIFEST_LOAD_ORDER = false		-- Will print the full name of the manifest upon first load
+local PRINT_DIRECTORY_MOVE_CHANGE = false		-- Will print where directories are being moved
+local PRINT_LOAD_ORDER = false					-- Will print the name of the module being loaded upon first load
 
 ----------------------------------
 --		MISC VARIABLES
@@ -37,15 +46,42 @@ local default = {}
 local ServerIgnoreClientDirectories = {
 	game:GetService("StarterGui"),
 	game:GetService("StarterPack"),
-	game:GetService("StarterPlayer"),
+	game:GetService("StarterPlayer")
 }
 
 ----------------------------------
 --		PRIVATE FUNCTIONS
 ----------------------------------
-local errorNoBreak = function(err)
+local function rovaPrint(f_message, f_prefix)
+	f_prefix = f_prefix or ""
+	if RS:IsServer() then
+		print(f_prefix.."[S_Rova]: "..f_message)
+	else
+		print(f_prefix, "[C_Rova]:"..f_message)
+	end
+end
+
+local function rovaWarn(f_message, f_prefix)
+	f_prefix = f_prefix or ""
+	if RS:IsServer() then
+		warn(f_prefix.."[S_Rova]: "..f_message)
+	else
+		warn(f_prefix, "[C_Rova]:"..f_message)
+	end
+end
+
+local function rovaError(f_message, f_prefix)
+	f_prefix = f_prefix or ""
+	if RS:IsServer() then
+		error(f_prefix.."[S_Rova]: "..f_message)
+	else
+		error(f_prefix.."[C_Rova]:"..f_message)
+	end
+end
+
+local function errorNoBreak(f_err, f_prefix)
 	spawn(function()
-		error(err.."\n"..debug.traceback())
+		rovaError(f_err, f_prefix)
 	end)
 	wait()
 end
@@ -93,124 +129,143 @@ local function retrieve(name, class, Parent, yields)
 	return SearchInstance, instanceCreated
 end
 
-local function loadModule(Module)
-	local moduleHandle;
-	if typeof(Module) == "string" then
-		moduleHandle = Module
-	elseif typeof(Module) == "Instance" then
-		moduleHandle = Module.Name
+local function loadModule(f_Module)
+	local moduleHandle
+	local ModuleObject
+	
+	if typeof(f_Module) == "string" then
+		moduleHandle = f_Module
+	elseif typeof(f_Module) == "Instance" then
+		moduleHandle = f_Module.Name
 	end
-
-	local Module = packages[moduleHandle]
-	if typeof(Module) == "Instance" then
+	
+	if PRINT_LOAD_ORDER then
+		rovaPrint("Loading module "..moduleHandle.."...")
+	end
+	
+	f_Module = packages[moduleHandle]
+	if typeof(f_Module) == "Instance" then
+		ModuleObject = f_Module
 		local success, err = pcall(function()
-			local ModuleObject = Module
-			Module = require(Module)
-			-- If on client, also deletes the module
-			if RS:IsClient() then
-				ModuleObject:Destroy()
+			local ModuleObject = f_Module
+			
+			local loaded = false
+			coroutine.wrap(function()
+				f_Module = require(f_Module)
+				loaded = true
+			end)()
+			for i = 0, MODULE_LOAD_TIMEOUT, 0.05 do
+				if loaded then break end
+				wait(0.05)
+			end
+			if not loaded then
+				error("\tModule load timed out.")
 			end
 		end)
 		if not success then
-			error("Failed to load module "..Module:GetFullName()..". Errata as follows:\n"..err)
+			packages[moduleHandle] = nil
+			error(err)
 		end
-		packages[moduleHandle] = Module
-		return Module
-	elseif typeof(Module) == "table" then
-		return Module
+		
+		if RS:IsClient() and CLIENT_DELETE_MODULE_AFTER_CACHE and ModuleObject then
+			ModuleObject:Destroy()
+		end
+		
+		-- Module loaded.
+		if PRINT_LOAD_ORDER then
+			rovaPrint("Success loading "..moduleHandle..".", "\t")
+		end
+		packages[moduleHandle] = f_Module
+		return f_Module
+	elseif typeof(f_Module) == "table" then
+		return f_Module
 	end
 end
 
-local function manifestHandleInit(ManifestFile)
-	local manifest = nil
+local function importInjectHandler(f_moduleName)
+	local fenv = getfenv(0)
+	
+	fenv[f_moduleName] = loadModule(f_moduleName)
+end
+
+local function initHandler()
+	if USE_INJECTED_METHODS then
+		local fenv = getfenv(0)
+
+		-- Injecting new methods
+		fenv.import = importInjectHandler
+	end
+end
+
+local function manifestHandleInit(f_frameworkTable)
+	if PRINT_MANIFEST_LOAD_ORDER then
+		rovaPrint("Loading manifest "..f_frameworkTable.Manifest:GetFullName())
+	end
 	local success, err = pcall(function()
-		manifest = require(ManifestFile)
+		f_frameworkTable.Manifest = require(f_frameworkTable.Manifest)
 	end)
 	if not success then
-		error("Failed to load module "..ManifestFile:GetFullName()..": "..err)
+		error(err)
 	end
-	return manifest
+	if PRINT_MANIFEST_LOAD_ORDER then
+		rovaPrint("Manifest Load Success.", "\t")
+	end
 end
 
-local function manifestHandleMove(ManifestFile)
-	local manifest = require(ManifestFile)
+local function manifestHandleMove(f_frameworkTable)
+	local manifest = f_frameworkTable.Manifest
 	
 	-- If on the server, move folders to proper location
-	if not RS:IsClient() then
+	if RS:IsServer() then
 		if manifest.__location then
-			local FrameworkFolder = retrieve("RovaFramework", "Folder", manifest.__location)
-			CS:AddTag(ManifestFile.Parent, FRAMEWORK_TAG_NAME)
-			ManifestFile.Parent.Parent = FrameworkFolder
+			local newFrameworkLocation = retrieve("RovaFramework", "Folder", manifest.__location)
+			CS:AddTag(f_frameworkTable.Instance, FRAMEWORK_TAG_NAME)
+			f_frameworkTable.Instance.Parent = newFrameworkLocation
+			if PRINT_DIRECTORY_MOVE_CHANGE then
+				rovaPrint("Moved "..f_frameworkTable.Instance:GetFullName().." -> "..newFrameworkLocation:GetFullName())
+			end
 		end
 	end
 end
 
-local function manifestHandleLoad(ManifestFile)
-	local manifest = require(ManifestFile)
+local function manifestHandleLoad(f_frameworkTable)
+	local manifest = f_frameworkTable.Manifest
 	
 	-- Implementation of ignore function based on tag in manifest
 	if manifest.__tags then
 		if RS:IsClient() then
-			--print("Client: Ignoring "..ManifestFile:GetFullName())
 			if isInTable("ClientIgnore", manifest.__tags) then return end
 		else
-			--print("Server: Ignoring "..ManifestFile:GetFullName())
 			if isInTable("ServerIgnore", manifest.__tags) then return end
 		end
 	end
-
-	-- Handles the loading of manifest-defined modules
+	
 	for index, path in pairs(manifest) do
-		if string.sub(index, 1, 2) == "__" then continue end
-
-		local splitPath = string.split(path, ".")
-		local Module = frameworkFolders
-		for _, directory in pairs(splitPath) do
-			Module = Module[directory]
-		end
-		coroutine.wrap(loadModule)(Module)
-	end
-end
-
-local function importHandler(moduleName)
-	local fenv = getfenv(0)
-
-	fenv[moduleName] = loadModule(moduleName)
-end
-
---[[	
-	@DEPRECIATED
-	Due to roblox's getfenv() limitations in scripts, getfenv doesn't actually get the the variables in the
-	local environment. I.e. if public is defined in the 0th fenv, getfenv will not see it.
-	RIP one of the major functionalities of Rova ;-;
-]]
-local function extendsHandler(superName)
-	local fenv = getfenv(0)
-
-	-- Makes sure that super is properly imported
-	if(typeof(superName) == "string") then
-		if not (fenv[superName]) then
-			error("Failed to extend class \'"..superName.."\', make sure the class is imported:\n"..debug.traceback())
-		end
-	end
-
-	local public = fenv.public
-
-	-- Implements super as actual super
-	fenv.super = fenv[superName]
-
-	fenv.public = setmetatable(fenv.public, {__index = fenv[superName]})
-	fenv.public.__index = fenv.public
-
-	--setmetatable(fenv.public, {__index = fenv[superName]})
-end
-
-local function initHandler(Module)
-	if USE_INJECTED_METHODS then
-		local fenv = getfenv(0)
+		if string.sub(index, 1, 2) == "__" then continue end	-- Ignore index paths beginning with '__'
 		
-		-- Injecting new methods
-		fenv.import = importHandler
+		local splitPath = string.split(path, ".")
+		local superFolder = splitPath[1]
+		local Module = frameworkFolders[superFolder].Instance
+
+		for i, directory in pairs(splitPath) do
+			if i == 1 then continue end	-- Solves the edge case of where the first item in the list is normally a frameworkTable 
+			
+			Module = Module:FindFirstChild(directory)
+			
+			if not Module then
+				break	-- Failed to find the object by path
+			end
+		end
+		
+		if not Module then	-- Failed to find object by path. Assume already loaded in.
+			return
+		end
+		
+		-- Begin loading module
+		local success, err = pcall(loadModule, Module)
+		if not success then
+			errorNoBreak("Failed to load module\n\t"..path.."\nErrata as follows:\n"..err)
+		end
 	end
 end
 
@@ -222,32 +277,45 @@ end
 	@f_name <String> name of library
 	@returns <table> table of functions from library
 ]]
-function module:LoadLibrary(f_name)
+function module.Import(f_name)
 	return loadModule(f_name)
+end
+
+--[[
+	Implementation for legacy calling of the modules
+]]
+function module:LoadLibrary(f_name)
+	return module.Import(f_name)
 end
 
 ----------------------------------
 --		MAIN CODE
 ----------------------------------
 
--- Getting FrameworkFolders
+-- Catalogin framework folders
 if RS:IsClient() then
 	for _, Folder in pairs(CS:GetTagged(FRAMEWORK_TAG_NAME)) do
-		frameworkFolders[Folder.Name] = Folder
+		local folderTable = {}
+		folderTable.Instance = Folder
+		folderTable.Manifest = Folder:FindFirstChild(".Manifest")
+		frameworkFolders[Folder.Name] = folderTable
 	end
 else
 	for _, Folder in pairs(ServerScriptService.RovaFramework:GetChildren()) do
 		if Folder:IsA("Folder") then
-			frameworkFolders[Folder.Name] = Folder
+			local folderTable = {}
+			folderTable.Instance = Folder
+			folderTable.Manifest = Folder:FindFirstChild(".Manifest")
+			frameworkFolders[Folder.Name] = folderTable
 		end
 	end
 end
 
--- Caching all modules
+-- Caching modules
 for _, FrameworkFolder in pairs(frameworkFolders) do
-	for _, Module in pairs(FrameworkFolder:GetDescendants()) do
-		if not Module:IsA("ModuleScript") then continue end
-		if string.sub(Module.Name, 1, 1) == "." then continue end
+	for _, Module in pairs(FrameworkFolder.Instance:GetDescendants()) do
+		if not Module:IsA("ModuleScript") then continue end		-- skip if the module isnt actually a module
+		if string.sub(Module.Name, 1, 1) == "." then continue end	-- skip if the module is preceded by a period '.'
 		packages[Module.Name] = Module
 	end
 end
@@ -255,48 +323,56 @@ end
 -- Storing reference to rova in _G
 _G.Rova = module
 
--- Initializing _G as callable table
-setmetatable(_G, {__call = initHandler})
+-- Initializing _G as a callable table (if applicable)
+if USE_INJECTED_METHODS then
+	setmetatable(_G, {__call = initHandler})
+end
 
--- Handle initialization of manifest files
-for _, FrameworkFolder in pairs(frameworkFolders) do
-	local Manifest = FrameworkFolder:FindFirstChild(".Manifest")
+-- Handle initialization of manifest file
+for _, frameworkTable in pairs(frameworkFolders) do
+	local Manifest = frameworkTable.Manifest
 	
-	if not Manifest then
-		errorNoBreak(FrameworkFolder:GetFullName().." is missing a manifest file")
-		continue
+	if not Manifest then	-- Manifest not found. Error, but does not interrupt the framework.
+		errorNoBreak(frameworkTable.Instance.Name.." is missing a manifest file.\n\t"..frameworkTable.Instance:GetFullName())
 	end
 	
-	local success, err = pcall(manifestHandleInit, Manifest)
-	if not success then
-		error("[Manifest Initialization Failure]: "..Manifest:GetFullName()..". Errata as follows:\n"..err)
+	-- Manifest found. Attempting to load.
+	local success, err = pcall(manifestHandleInit, frameworkTable)
+	if not success then		-- Failed to load. Print location of manifest and what went wrong.
+		rovaError("Manifest Initialization Failure.\nManifest failed to load at:\n\t"..Manifest:GetFullName().."\nPlease verify integrity.\nErrata as follows:\n"..err)
 	end
 end
 
--- Handle moving of framework folders
-for _, FrameworkFolder in pairs(frameworkFolders) do
-	local Manifest = FrameworkFolder:FindFirstChild(".Manifest")
+-- All found manifests verified. Proceed with moving framework directories.
+
+-- Handle the movement of the framework folders
+for _, frameworkTable in pairs(frameworkFolders) do
+	local manifest = frameworkTable.Manifest
 	
-	local success, err = pcall(manifestHandleMove, Manifest)
-	if not success then
-		error("[Directory Move Failure]: "..Manifest:GetFullName()..". Errata as follows:\n"..err)
+	local success, err = pcall(manifestHandleMove, frameworkTable)
+	if not success then		-- Failed to load framework folders to designated location. Print location of manifest and what went wrong.
+		rovaError("Directory Move Failure.\nManifest failed to move target directory to designated location:\n\t"..frameworkTable.Instance:GetFullName().."..Manifest\nErrata as follows:\n"..err)
 	end
 end
 
--- Handles loading of the modules defined in the manifest file
-for _, FrameworkFolder in pairs(frameworkFolders) do
-	local Manifest = FrameworkFolder:FindFirstChild(".Manifest")
+-- All framework directories moved. Proceed with loading modules.
 
-	local success, err = pcall(manifestHandleLoad, Manifest)
+-- Handle loading of modules defined in the manifest file
+for _, frameworkTable in pairs(frameworkFolders) do
+	local Manifest = frameworkTable.Manifest
+	
+	local success, err = pcall(manifestHandleLoad, frameworkTable)
 	if not success then
-		error("[Module Load Failure]: "..Manifest:GetFullName()..". Errata as follows:\n"..err)
+		rovaError("Module Load Failure.\nManifest failed to load:\n\t"..frameworkTable.Instance:GetFullName().."..Manifest\nErrata as follows:\n"..err)
 	end
 end
 
--- Clear _G.Rova and _G() on client in order to avoid security problems
+-- Clear _G.Rova and _G() on client if specified
 if RS:IsClient() and CLEAR_GLOBAL_AFTER_LOAD_ON_CLIENT then
 	_G.Rova = nil
 	setmetatable(_G, {__call = nil})
 end
+
+rovaWarn("Framework Loaded.")
 
 return module
